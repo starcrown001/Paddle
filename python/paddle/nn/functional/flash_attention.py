@@ -506,13 +506,13 @@ def flash_attention(
         ), "flash attention 3 does not support return softmax"
         assert (
             fixed_seed_offset is None or fa_version == 2
-        ), "flash attention 3 does not support return softmax"
+        ), "flash attention 3 does not support setting seed_offset"
         assert (
             rng_name == "" or fa_version == 2
         ), "flash attention 3 does not support setting rng_name"
         assert (
             training or fa_version == 2
-        ), "flash attention 3 does not support setting training"
+        ), "flash attention 3 does not support setting training to False"
         assert (
             name is None or fa_version == 2
         ), "flash attention 3 does not support setting name"
@@ -1016,6 +1016,79 @@ def flash_attn_unpadded(
     return out, softmax if return_softmax else None
 
 
+def flash_attn_varlen_v3(
+    query,
+    key,
+    value,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    seqused_q=None,
+    seqused_k=None,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    window_size=(-1, -1),
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    sm_margin=0,
+):
+    assert (
+        "xpu" not in paddle.get_device()
+    ), "flash_attn_varlen_v3 is not supported on xpu"
+
+    assert not paddle.get_flags(["FLAGS_cudnn_deterministic"])[
+        "FLAGS_cudnn_deterministic"
+    ], "flash_attn_varlen_v3 does not support deterministic"
+
+    assert (
+        paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])[
+            "FLAGS_flash_attn_version"
+        ]
+        == 3
+    ), "FLAGS_flash_attn_version is 2, conflits with flash_attn_varlen_v3"
+
+    assert (
+        in_dynamic_or_pir_mode()
+    ), "flash_attn_varlen_v3 only support dynamic or pir mode"
+
+    if softmax_scale is None:
+        softmax_scale = (
+            query.shape[-1] + (qv.shape[-1] if qv is not None else 0)
+        ) ** (-0.5)
+
+    out, softmax_lse = _C_ops.flash_attn_varlen_v3(
+        query,
+        key,
+        value,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        qv,
+        q_descale,
+        k_descale,
+        v_descale,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        num_splits,
+        pack_gqa is not None,
+        pack_gqa if pack_gqa is not None else False,
+        sm_margin,
+    )
+    return out, softmax_lse
+
+
 @overload
 def flash_attn_varlen_qkvpacked(
     qkv: Tensor,
@@ -1376,6 +1449,7 @@ def flashmask_attention(
     rng_name: str = "",
     training: bool = True,
     name: str | None = None,
+    softmax_scale: float | None = None,
 ):
     r"""
     FlashMask: Official Implementation
@@ -2066,6 +2140,20 @@ def flashmask_attention(
                     f"Invalid shape of startend_row_indices, when causal is False, the last dimension should be either 2 or 4 but got {startend_row_indices.shape[-1]}"
                 )
 
+    if paddle.get_flags(["FLAGS_cudnn_deterministic"])[
+        "FLAGS_cudnn_deterministic"
+    ]:
+        fa_version = 2
+    else:
+        fa_version = paddle.base.framework.get_flags(
+            ["FLAGS_flash_attn_version"]
+        )["FLAGS_flash_attn_version"]
+
+    if fa_version == 2:
+        assert (
+            softmax_scale is None
+        ), "flashmask_attention does not support setting softmax_scale, use flashmask_attention_v2 instead"
+
         (
             out,
             result_softmax,
@@ -2084,15 +2172,60 @@ def flashmask_attention(
             rng_name,
         )
 
-    outputs = [out]
-    if return_softmax_lse:
-        outputs += [result_softmax_lse]
-    if return_seed_offset:
-        outputs += [result_seed_offset]
-    if len(outputs) == 1:
-        return outputs[0]
-    else:
+        outputs = [out]
+        if return_softmax_lse:
+            outputs += [result_softmax_lse]
+        if return_seed_offset:
+            outputs += [result_seed_offset]
+        if len(outputs) == 1:
+            return outputs[0]
+        else:
+            return outputs
+    elif fa_version == 3:
+        assert (
+            dropout == 0.0
+        ), "flashmask_attention_v2 does not support dropout"
+        assert (
+            not return_seed_offset
+        ), "flashmask_attention_v2 does not support return seed_offset"
+        assert (
+            fixed_seed_offset is None
+        ), "flashmask_attention_v2 does not support setting seed_offset"
+        assert (
+            rng_name == ""
+        ), "flashmask_attention_v2 does not support setting rng_name"
+        assert (
+            training
+        ), "flashmask_attention_v2 does not support setting training to False"
+
+        assert (
+            name is None
+        ), "flashmask_attention_v2 does not support setting name"
+
+        if softmax_scale is None:
+            softmax_scale = query.shape[-1] ** (-0.5)
+
+        (
+            out,
+            softmax_lse,
+        ) = _C_ops.flashmask_attention_v2(
+            query,
+            key,
+            value,
+            startend_row_indices,
+            softmax_scale,
+            causal
+        )
+
+        outputs = [out]
+        if return_softmax_lse:
+            outputs += [softmax_lse]
         return outputs
+    else:
+        raise ValueError(
+            f"Invalid flash attention version: {fa_version}"
+        )
+
 
 
 def calc_reduced_attention_scores(
