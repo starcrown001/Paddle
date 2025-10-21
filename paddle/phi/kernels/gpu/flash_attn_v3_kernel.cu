@@ -1233,7 +1233,8 @@ void FlashMaskV2BaseKernel(
     const paddle::optional<DenseTensor> &k_descale_,  // (b, h_k)
     const paddle::optional<DenseTensor> &v_descale_,  // (b, h_k)
     const paddle::optional<DenseTensor> &scheduler_metadata_,  // (b + 1)
-    const paddle::optional<DenseTensor> &startend_row_indices_,
+    const paddle::optional<DenseTensor> &startend_row_indices_,// （b,h,s_1,[1,2,4])
+    const paddle::optional<DenseTensor> &block_mask_indices_, //(b,h,s// 128,s // 128)
     const int
         max_seqlen_q_,  // if max_seqlen_q_ is set to 0, it indicates that it is
                         // uninitialized and should not be referenced
@@ -1430,6 +1431,7 @@ void FlashMaskV2BaseKernel(
   }
 
   bool const is_flashmask = startend_row_indices_.is_initialized();
+  bool const is_blockmask = block_mask_indices_.is_initialized();
 
   // This needs to go before kBlockM & kBlockN since we rely on the correct
   // window_size and is_causal to set kBlockM
@@ -2066,6 +2068,8 @@ void FlashMaskV2BaseKernel(
   // flashmask
   DenseTensor startend_row_indices;
   if (is_flashmask) startend_row_indices = startend_row_indices_.get();
+  DenseTensor block_mask_indices;
+  if (is_blockmask) block_mask_indices = block_mask_indices_.get();
   DenseTensor flashmask_maxmin, lt_start_row_indices, lt_end_row_indices,
       ut_start_row_indices, ut_end_row_indices;
   if (is_flashmask) {
@@ -2114,6 +2118,52 @@ void FlashMaskV2BaseKernel(
       ut_start_row_indices =
           phi::Slice<int32_t>(dev_ctx, startend_row_indices, {3}, {2}, {3});
     }
+  }
+
+  if (is_blockmask){
+    PADDLE_ENFORCE_EQ(
+      is_flashmask,
+      true,
+      common::errors::InvalidArgument(
+          "blockmask should be used with flashmask at the same time "));
+
+    PADDLE_ENFORCE_EQ(
+        block_mask_indices.dims().size(),
+        4,
+        common::errors::InvalidArgument(
+            "blockmask receive blockmask_indices with dim "
+            "[batch_size, num_heads, blocklen_q, blocklen_k]"));
+
+    PADDLE_ENFORCE_EQ(
+      block_mask_indices.dims()[2],
+      (seqlen_q + 127) / 128,
+      common::errors::InvalidArgument(
+          "blockmask is now only support blockdim_q = 128 "));
+
+    PADDLE_ENFORCE_EQ(
+      block_mask_indices.dims()[3],
+      (seqlen_k + 127)/ 128,
+      common::errors::InvalidArgument(
+          "blockmask is now only support blockdim_k = 128 "));
+
+    PADDLE_ENFORCE_EQ(
+      block_mask_indices.dims()[1] ,
+      startend_row_indices.dims()[1],
+      common::errors::InvalidArgument(
+          "blockmask is now only support same dim num_heads with flashmask "));
+  }
+
+  if (is_blockmask){
+    //xhy: blockmask is now only support blockdim_q k = 128
+    dynload::flashmaskv2_fwd_params_set_m_block_dim(
+          params_handle,
+          128);
+    dynload::flashmaskv2_fwd_params_set_n_block_dim(
+          params_handle,
+          128);
+    dynload::flashmaskv2_fwd_params_set_block_mask_ptr(
+        params_handle,
+        const_cast<int32_t *>(block_mask_indices.data<int32_t>()));
   }
 
   if (is_flashmask) {
@@ -2234,6 +2284,7 @@ void FlashMaskV2Kernel(const Context &dev_ctx,
                        const DenseTensor &k,
                        const DenseTensor &v,
                        const DenseTensor &startend_row_indices,
+                       const paddle::optional<DenseTensor>& block_mask_indices,
                        const float softmax_scale,
                        bool is_causal,
                        DenseTensor *out,
@@ -2264,6 +2315,7 @@ void FlashMaskV2Kernel(const Context &dev_ctx,
                                     paddle::none,  // v_descale_
                                     paddle::none,  // scheduler_metadata_
                                     startend_row_indices,
+                                    block_mask_indices,
                                     0,  // max_seqlen_q_
                                     0,  // max_seqlen_k_
                                     softmax_scale,
@@ -2307,4 +2359,7 @@ PD_REGISTER_KERNEL(flashmask_attention_v2,
                    ALL_LAYOUT,
                    phi::FlashMaskV2Kernel,
                    phi::float16,
-                   phi::bfloat16) {}
+                   phi::bfloat16) {
+                    kernel->InputAt(4).SetBackend(
+                          phi::Backend::ALL_BACKEND); //block_mask_indices
+                   }

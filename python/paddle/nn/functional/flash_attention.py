@@ -1595,6 +1595,7 @@ def flashmask_attention(
     training: bool = True,
     name: str | None = None,
     softmax_scale: float | None = None,
+    block_mask_indices: Tensor | None = None,
 ):
     r"""
     FlashMask: Official Implementation
@@ -2227,6 +2228,12 @@ def flashmask_attention(
                 startend_row_indices, min=0, max=sq
             ).repeat_interleave(bsz, 0)
 
+    if block_mask_indices is not None:
+        # xhy: can set a full startend_row_indices for block_mask_attn when using block_mask_attn?
+        assert startend_row_indices is not None, (
+            "must provide startend_row_indices when using block_mask_attn"
+        )
+
     if startend_row_indices is None:
         (
             out,
@@ -2267,6 +2274,29 @@ def flashmask_attention(
         ], (
             "startend_row_indices head_num must be equal to 1(broadcast) or head_num_k."
         )
+
+        if block_mask_indices is not None:
+            assert block_mask_indices.dtype == paddle.int32, (
+                f"block_mask_indices.dtype must be paddle.int32, but got {block_mask_indices.dtype}"
+            )
+
+            assert block_mask_indices.shape[0] == key.shape[0], (
+                f"block_mask_indices.shape[0] must be equal to batch_size, but got {block_mask_indices.shape[0]} and {key.shape[0]}"
+            )
+
+            assert (
+                block_mask_indices.shape[1] == startend_row_indices.shape[1]
+            ), (
+                f"block_mask_indices.shape[1] must be equal to startend_row_indices.shape[1], but got {block_mask_indices.shape[1]} and {key.shape[2]}"
+            )
+
+            assert (
+                block_mask_indices.shape[2] == (query.shape[1] + 127) // 128
+            ), "block_size must be 128 when using block_mask_attn"
+
+            assert block_mask_indices.shape[3] == (key.shape[1] + 127) // 128, (
+                "block_size must be 128 when using block_mask_attn"
+            )
 
         if causal:
             if startend_row_indices.shape[-1] == 1:
@@ -2349,7 +2379,13 @@ def flashmask_attention(
                 out,
                 result_softmax_lse,
             ) = _C_ops.flashmask_attention_v2(
-                query, key, value, startend_row_indices, softmax_scale, causal
+                query,
+                key,
+                value,
+                startend_row_indices,
+                block_mask_indices,
+                softmax_scale,
+                causal,
             )
         else:
             raise ValueError(f"Invalid flash attention version: {fa_version}")
