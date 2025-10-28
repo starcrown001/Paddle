@@ -849,6 +849,7 @@ void FlashMaskV2GradBaseKernel(
         &seqused_k_,  // b. If given, only this many elements of each batch
                       // element's keys are used.
     const paddle::optional<DenseTensor> &startend_row_indices_,
+    const paddle::optional<DenseTensor> &block_mask_indices_, //(b,h,s// 128,s // 128)
     int max_seqlen_q_,
     int max_seqlen_k_,
     float const softmax_scale,
@@ -1020,27 +1021,124 @@ void FlashMaskV2GradBaseKernel(
   bool const is_local =
       (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
   bool const is_flashmask = startend_row_indices_.is_initialized();
+  bool const is_blockmask = block_mask_indices_.is_initialized();
 
-  int const kBlockM_sm90 =
-      head_size_rounded <= 64
-          ? (is_flashmask && !is_causal)
-                ? 64
-                : (is_causal && softcap || is_flashmask > 0.0 ? 96 : 128)
-          : (head_size_rounded <= 128
-                 ? (is_causal || is_local || softcap > 0.0
-                        ? 64
-                        : 64)
-                 : 64);
+  DenseTensor startend_row_indices;
+  if (is_flashmask) startend_row_indices = startend_row_indices_.get();
+  bool const has_softcap = softcap > 0.0;
+ DenseTensor flashmask_maxmin, lt_start_row_indices, lt_end_row_indices,
+      ut_start_row_indices, ut_end_row_indices;
+  if (is_flashmask) {
+    PADDLE_ENFORCE_EQ(
+        startend_row_indices.dtype(),
+        phi::DataType::INT32,
+        common::errors::InvalidArgument(
+            "flashmask_attention startend_row_indices must be INT32 type"));
+    PADDLE_ENFORCE_EQ(
+        startend_row_indices.dims().size(),
+        4,
+        common::errors::InvalidArgument(
+            "flashmask_attention receive startend_row_indices with dim "
+            "[batch_size, num_heads,seq_len, mask_bounds]"));
+    PADDLE_ENFORCE_EQ(startend_row_indices.dims()[3] == 1 ||
+                          startend_row_indices.dims()[3] == 2 ||
+                          startend_row_indices.dims()[3] == 4,
+                      true,
+                      common::errors::InvalidArgument(
+                          "flashmask_attention startend_row_indices "
+                          "mask_bounds must in [1,2,4]"));
+
+    auto flashmask_maxmin_shape = startend_row_indices.dims();
+    // TODO(umiswing): refine this block constraint (kBlockN % 32), since some
+    // of kBlockN is not divisible by 32 flashmask_maxmin_shape[2] =
+    // (flashmask_maxmin_shape[2] + 31) / 32 * 8;
+    flashmask_maxmin_shape[2] =
+        ((flashmask_maxmin_shape[2] + 32 -1 ) / 32 + 3) / 4 * 4;
+    flashmask_maxmin_shape[3] = 8;
+
+    flashmask_maxmin.set_type(phi::DataType::INT32);
+    flashmask_maxmin.Resize(flashmask_maxmin_shape);
+    dev_ctx.template Alloc<int32_t>(&flashmask_maxmin);
+
+    lt_start_row_indices =
+        phi::Slice<int32_t>(dev_ctx, startend_row_indices, {3}, {0}, {1});
+    if (startend_row_indices.dims()[3] == 2) {
+      if (!is_causal) {
+        ut_end_row_indices =
+            phi::Slice<int32_t>(dev_ctx, startend_row_indices, {3}, {1}, {2});
+      } else {
+        lt_end_row_indices =
+            phi::Slice<int32_t>(dev_ctx, startend_row_indices, {3}, {1}, {2});
+      }
+    } else if (startend_row_indices.dims()[3] == 4) {
+      ut_end_row_indices =
+          phi::Slice<int32_t>(dev_ctx, startend_row_indices, {3}, {3}, {4});
+      lt_end_row_indices =
+          phi::Slice<int32_t>(dev_ctx, startend_row_indices, {3}, {1}, {2});
+      ut_start_row_indices =
+          phi::Slice<int32_t>(dev_ctx, startend_row_indices, {3}, {2}, {3});
+    }
+  }
+
+  const bool has_lt_start = lt_start_row_indices.initialized();
+  const bool has_lt_end = lt_end_row_indices.initialized();
+  const bool has_ut_start = ut_start_row_indices.initialized();
+  const bool has_ut_end = ut_end_row_indices.initialized();
+
+  // umiswing: The tile dispatch for flashmask is now different from fa3.
+  // Replacing the original ternary operator with lambda makes the code
+  // easier to reason about and less error-prone.
+  const auto [kBlockM_sm90, kBlockN_sm90] = [&]() -> std::pair<int, int> {
+    if (head_size_rounded <= 64) {
+      if (is_flashmask && !is_causal) {
+        return {64, 96};
+      } else if (is_causal && has_softcap || is_flashmask) {
+        return {96, 128};
+      } else {
+        return {128, 128};
+      }
+    } else if (head_size_rounded <= 128) {
+      // umiswing: by now, we reuse template instantiation of head dim 128 for
+      // head dim in range (64, 128], and therefore no separate dispatch for
+      // head dim in range (64, 96]
+      if (is_causal || is_local || has_softcap) {
+        return {64, 128};
+      } else {
+        if ((seqlen_q >= 1024 || seqlen_k >= 1024) &&
+            !(has_lt_end && has_ut_start)) {
+          return {64, 128};
+        } else {
+          return {64, 64};
+        }
+      }
+    } else if (head_size_rounded <= 192) {
+      // umiswing: head dim > 128 is not supported now
+      PADDLE_THROW(
+          common::errors::Unimplemented("head dim is rounded to %d, which is "
+                                        "not supported in FlashMask V3 now.",
+                                        head_size_rounded));
+      return {0, 0};
+    } else if (head_size_rounded <= 256) {
+      // umiswing: head dim > 128 is not supported now
+      PADDLE_THROW(
+          common::errors::Unimplemented("head dim is rounded to %d, which is "
+                                        "not supported in FlashMask V3 now.",
+                                        head_size_rounded));
+      return {0, 0};
+    } else {
+      PADDLE_THROW(
+          common::errors::Unimplemented("head dim is rounded to %d, which is "
+                                        "not supported in FlashMask V3 now.",
+                                        head_size_rounded));
+      return {0, 0};
+    }
+  }();
 
   int const kBlockM_sm80 = head_size_rounded <= 64 ? 128 : 64;
   int const kBlockM_sm86 = head_size_rounded <= 192 ? 64 : 32;
   int const kBlockM =
       arch >= 90 ? kBlockM_sm90
                  : (arch == 86 || arch == 89 ? kBlockM_sm86 : kBlockM_sm80);
-  int const kBlockN_sm90 =
-      head_size_rounded <= 64 && (is_flashmask && !is_causal) ? 96
-      : head_size_rounded <= 128 ? (is_causal || is_local || softcap > 0.f || seqlen_q >= 8192 ? 128 : 64)
-                                 : (head_size_rounded <= 192 ? 96 : 80);
   int const kBlockN_sm80 =
       head_size_rounded <= 128 ? 128 : (head_size_rounded <= 192 ? 80 : 64);
   int const kBlockN_sm86 =
@@ -1308,60 +1406,56 @@ void FlashMaskV2GradBaseKernel(
                                                      dv_semaphore.data<int>());
   }
   // flashmask
-  DenseTensor startend_row_indices;
-  if (is_flashmask) startend_row_indices = startend_row_indices_.get();
-  DenseTensor flashmask_maxmin, lt_start_row_indices, lt_end_row_indices,
-      ut_start_row_indices, ut_end_row_indices;
-  if (is_flashmask) {
+  DenseTensor block_mask_indices;
+  if (is_blockmask) block_mask_indices = block_mask_indices_.get();
+  
+  if (is_blockmask){
     PADDLE_ENFORCE_EQ(
-        startend_row_indices.dtype(),
-        phi::DataType::INT32,
-        common::errors::InvalidArgument(
-            "flashmask_attention startend_row_indices must be INT32 type"));
+      is_flashmask,
+      true,
+      common::errors::InvalidArgument(
+          "blockmask should be used with flashmask at the same time "));
+
     PADDLE_ENFORCE_EQ(
-        startend_row_indices.dims().size(),
+        block_mask_indices.dims().size(),
         4,
         common::errors::InvalidArgument(
-            "flashmask_attention receive startend_row_indices with dim "
-            "[batch_size, num_heads,seq_len, mask_bounds]"));
-    PADDLE_ENFORCE_EQ(startend_row_indices.dims()[3] == 1 ||
-                          startend_row_indices.dims()[3] == 2 ||
-                          startend_row_indices.dims()[3] == 4,
-                      true,
-                      common::errors::InvalidArgument(
-                          "flashmask_attention startend_row_indices "
-                          "mask_bounds must in [1,2,4]"));
+            "blockmask receive blockmask_indices with dim "
+            "[batch_size, num_heads, blocklen_q, blocklen_k]"));
 
-    auto flashmask_maxmin_shape = startend_row_indices.dims();
-    // TODO(umiswing): refine this block constraint (kBlockN % 32), since some
-    // of kBlockN is not divisible by 32 flashmask_maxmin_shape[2] =
-    // (flashmask_maxmin_shape[2] + 31) / 32 * 8;
-    flashmask_maxmin_shape[2] =
-        ((flashmask_maxmin_shape[2] + 31) / 32 + 3) / 4 * 4;
-    flashmask_maxmin_shape[3] = 8;
+    PADDLE_ENFORCE_EQ(
+      block_mask_indices.dims()[2],
+      (seqlen_q + 127) / 128,
+      common::errors::InvalidArgument(
+          "blockmask is now only support blockdim_q = 128 "));
 
-    flashmask_maxmin.set_type(phi::DataType::INT32);
-    flashmask_maxmin.Resize(flashmask_maxmin_shape);
-    dev_ctx.template Alloc<int32_t>(&flashmask_maxmin);
+    PADDLE_ENFORCE_EQ(
+      block_mask_indices.dims()[3],
+      (seqlen_k + 127)/ 128,
+      common::errors::InvalidArgument(
+          "blockmask is now only support blockdim_k = 128 "));
 
-    lt_start_row_indices =
-        phi::Slice<int32_t>(dev_ctx, startend_row_indices, {3}, {0}, {1});
-    if (startend_row_indices.dims()[3] == 2) {
-      if (!is_causal) {
-        ut_end_row_indices =
-            phi::Slice<int32_t>(dev_ctx, startend_row_indices, {3}, {1}, {2});
-      } else {
-        lt_end_row_indices =
-            phi::Slice<int32_t>(dev_ctx, startend_row_indices, {3}, {1}, {2});
-      }
-    } else if (startend_row_indices.dims()[3] == 4) {
-      ut_end_row_indices =
-          phi::Slice<int32_t>(dev_ctx, startend_row_indices, {3}, {3}, {4});
-      lt_end_row_indices =
-          phi::Slice<int32_t>(dev_ctx, startend_row_indices, {3}, {1}, {2});
-      ut_start_row_indices =
-          phi::Slice<int32_t>(dev_ctx, startend_row_indices, {3}, {2}, {3});
-    }
+    PADDLE_ENFORCE_EQ(
+      block_mask_indices.dims()[1] ,
+      startend_row_indices.dims()[1],
+      common::errors::InvalidArgument(
+          "blockmask is now only support same dim num_heads with flashmask "));
+  }
+
+  if (is_blockmask){
+    //xhy: blockmask is now only support blockdim_q k = 128
+    dynload::flashmaskv2_bwd_params_set_m_block_dim(
+          params_handle,
+          128);
+    dynload::flashmaskv2_bwd_params_set_n_block_dim(
+          params_handle,
+          128);
+    dynload::flashmaskv2_bwd_params_set_block_mask_ptr(
+        params_handle,
+        const_cast<int32_t *>(block_mask_indices.data<int32_t>()));
+    // phi::funcs::SetConstant<Context, T> set_dq_zero;
+    // // dev_ctx.template Alloc<T>(dq);
+    // set_dq_zero(dev_ctx, dq, T{0});
   }
 
   if (is_flashmask) {
@@ -1463,6 +1557,7 @@ void FlashMaskV2GradKernel(
     const DenseTensor &out,
     const DenseTensor &softmax_lse,
     const DenseTensor &startend_row_indices,  // TODO(xiehaoyang): remove this
+    const paddle::optional<DenseTensor>& block_mask_indices,
     const DenseTensor &out_grad,
     float const softmax_scale,
     bool is_causal,
@@ -1499,6 +1594,7 @@ void FlashMaskV2GradKernel(
                                         paddle::none,
                                         paddle::none,
                                         startend_row_indices,
+                                        block_mask_indices,
                                         0,  // max_seqlen_q,
                                         0,  // max_seqlen_k,
                                         softmax_scale,
