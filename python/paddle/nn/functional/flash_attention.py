@@ -2297,6 +2297,10 @@ def flashmask_attention(
             assert block_mask_indices.shape[3] == (key.shape[1] + 127) // 128, (
                 "block_size must be 128 when using block_mask_attn"
             )
+            
+            assert key.shape[3] == 128, (
+                "headdim must be 128 when using block_mask_attn"
+            )
 
         if causal:
             if startend_row_indices.shape[-1] == 1:
