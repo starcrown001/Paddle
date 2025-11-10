@@ -1427,23 +1427,35 @@ void FlashMaskV2GradBaseKernel(
       block_mask_indices.dims()[2],
       (seqlen_q + 127) / 128,
       common::errors::InvalidArgument(
-          "blockmask is now only support blockdim_q = 128 "));
+          "blockmask only supports blockdim_q = 128 "));
 
     PADDLE_ENFORCE_EQ(
       block_mask_indices.dims()[3],
       (seqlen_k + 127)/ 128,
       common::errors::InvalidArgument(
-          "blockmask is now only support blockdim_k = 128 "));
+          "blockmask only supports  blockdim_k = 128 "));
 
     PADDLE_ENFORCE_EQ(
       block_mask_indices.dims()[1] ,
       startend_row_indices.dims()[1],
       common::errors::InvalidArgument(
-          "blockmask is now only support same dim num_heads with flashmask "));
+          "blockmask only supports  same dim num_heads with flashmask "));
+
+    PADDLE_ENFORCE_LE(
+      seqlen_k ,
+      128 * 1024,
+      common::errors::InvalidArgument(
+          "blockmask only supports seqlen <= 128k"));
+
+    PADDLE_ENFORCE_LE(
+      seqlen_q ,
+      128 * 1024,
+      common::errors::InvalidArgument(
+          "blockmask only supports seqlen <= 128k"));
   }
 
   if (is_blockmask){
-    //xhy: blockmask is now only support blockdim_q k = 128
+    //xhy: blockmask only supports support blockdim_q k = 128
     dynload::flashmaskv2_bwd_params_set_m_block_dim(
           params_handle,
           128);
